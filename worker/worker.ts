@@ -2,7 +2,7 @@
 // job. An agent runs detached, in its own process group, writing to files, so the worker can stop and come back and
 // find it still going, or finished. A job is saved before anything slow happens; a result is saved before it's handed
 // in and stays until the hub has taken it.
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -86,7 +86,7 @@ function save(entry: Entry) {
 function agentEnvironment(entry: Entry) {
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(process.env)) {
-    if (/^(AGENT_AUTOLOOP_|CLAUDECODE$|CLAUDE_CODE_|CODEX_(?!HOME$))/.test(name)) continue;
+    if (/^(AGENT_AUTOLOOP_|CLAUDECODE$|CLAUDE_CODE_|CODEX_(?!HOME$)|DSH_SESSION_ID$)/.test(name)) continue;
     env[name] = value;
   }
   return {
@@ -106,8 +106,21 @@ const files = (entry: Entry) => ({
 const quoted = (word: string) => `'${word.replaceAll("'", `'\\''`)}'`;
 const marker = (entry: Entry) => `agent-autoloop-run:${entry.run}:${entry.attempt}:${entry.turn}`;
 
+const WINDOWS = process.platform === "win32";
+
+/** Whether a process is still there. Windows has no ps to ask, but a pid this worker started is still its own to probe. */
+function present(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function alive(entry: Entry) {
   if (!entry.pid) return false;
+  if (WINDOWS) return present(entry.pid);
   try {
     const command = execFileSync("ps", ["-p", String(entry.pid), "-o", "command="], { encoding: "utf8" });
     return command.includes(marker(entry));
@@ -117,12 +130,20 @@ function alive(entry: Entry) {
 }
 
 function signal(entry: Entry, name: NodeJS.Signals) {
+  if (!entry.pid) return;
+  // Windows stops a tree rather than a process group: the run and everything it started go together.
+  if (WINDOWS) {
+    spawnSync("taskkill", ["/PID", String(entry.pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
   try {
-    if (entry.pid) process.kill(-entry.pid, name);
+    process.kill(-entry.pid, name);
   } catch {}
 }
 
 function groupAlive(entry: Entry) {
+  // Windows has no process groups to scan; the run's own process is the root of the tree taskkill takes down.
+  if (WINDOWS) return entry.pid !== undefined && present(entry.pid);
   // The wrapper can die before a child; zombies have already stopped and only their parent can reap them.
   return execFileSync("ps", ["-ax", "-o", "pgid=", "-o", "stat="], { encoding: "utf8" })
     .trim()
@@ -183,7 +204,7 @@ export function createWorker({
     delete entry.why;
     save(entry);
     const { rule, agent } = entry.job;
-    const cwd = rule.cwd.replace(/^~(?=\/)/, homedir());
+    const cwd = rule.cwd.replace(/^~(?=[/\\])/, homedir());
     const turn: Turn = {
       prompt,
       session: entry.session,
@@ -199,30 +220,43 @@ export function createWorker({
     if (!existsSync(cwd)) throw new Error(`在 ${cwd} 启动不了：这个目录不存在`);
     const argv = adapter.command(turn);
     const { out, err, exit, command } = files(entry);
-    // Login shells don't agree on how a command reads its arguments (fish has no $0 or $@), so the command waits in a
-    // file for /bin/sh. Its path travels by environment because the install path can hold any character.
-    writeFileSync(command, `unset AGENT_AUTOLOOP_COMMAND\nexec ${argv.map(quoted).join(" ")}\n`, { mode: 0o600 });
-    // Output and the exit code go through the shell, so they land in their files even if this program has gone by then.
-    const script = [
-      "out=$1",
-      "err=$2",
-      "result=$3",
-      "shift 3",
-      "umask 077",
-      '"$@" >"$out" 2>"$err"',
-      'echo $? >"$result.tmp"',
-      'mv "$result.tmp" "$result"',
-      // A final external command can replace the shell before publishing its exit file.
-      ":",
-    ].join("\n");
-    // The login shell gives it the PATH and sign-in its owner has in a terminal; launchd and systemd give neither.
-    const login = [process.env.SHELL ?? "/bin/sh", "-lc", 'exec /bin/sh "$AGENT_AUTOLOOP_COMMAND"'];
-    const child = spawn("/bin/sh", ["-c", script, marker(entry), out, err, exit, ...login], {
-      cwd,
-      env: { ...agentEnvironment(entry), AGENT_AUTOLOOP_COMMAND: command },
-      detached: true,
-      stdio: "ignore",
-    });
+    let child;
+    if (WINDOWS) {
+      // No /bin/sh to hand a command to: a runner process starts it, and gives the same output and exit files.
+      writeFileSync(command, JSON.stringify({ argv, out, err, exit, cwd }), { mode: 0o600 });
+      child = spawn(process.execPath, [path.join(import.meta.dirname, "runner.ts"), command], {
+        cwd,
+        env: agentEnvironment(entry),
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } else {
+      // Login shells don't agree on how a command reads its arguments (fish has no $0 or $@), so the command waits in a
+      // file for /bin/sh. Its path travels by environment because the install path can hold any character.
+      writeFileSync(command, `unset AGENT_AUTOLOOP_COMMAND\nexec ${argv.map(quoted).join(" ")}\n`, { mode: 0o600 });
+      // Output and the exit code go through the shell, so they land in their files even if this program has gone by then.
+      const script = [
+        "out=$1",
+        "err=$2",
+        "result=$3",
+        "shift 3",
+        "umask 077",
+        '"$@" >"$out" 2>"$err"',
+        'echo $? >"$result.tmp"',
+        'mv "$result.tmp" "$result"',
+        // A final external command can replace the shell before publishing its exit file.
+        ":",
+      ].join("\n");
+      // The login shell gives it the PATH and sign-in its owner has in a terminal; launchd and systemd give neither.
+      const login = [process.env.SHELL ?? "/bin/sh", "-lc", 'exec /bin/sh "$AGENT_AUTOLOOP_COMMAND"'];
+      child = spawn("/bin/sh", ["-c", script, marker(entry), out, err, exit, ...login], {
+        cwd,
+        env: { ...agentEnvironment(entry), AGENT_AUTOLOOP_COMMAND: command },
+        detached: true,
+        stdio: "ignore",
+      });
+    }
     child.on("error", (error) => log(`run ${entry.run}: ${error}`));
     child.unref();
     entry.pid = child.pid;

@@ -114,8 +114,11 @@ function linkSkill() {
 
 /** What to type to run this program: its name if that's what a shell finds, otherwise where it is. */
 function howToRun() {
-  const found = spawnSync("/bin/sh", ["-c", "command -v agent-autoloop"], { encoding: "utf8" }).stdout.trim();
-  if (found && realpathSync(found) === realpathSync(PROGRAM)) return "agent-autoloop";
+  const printed =
+    process.platform === "win32"
+      ? (spawnSync("where", ["agent-autoloop"], { encoding: "utf8" }).stdout ?? "").trim().split(/\r?\n/)[0]
+      : spawnSync("/bin/sh", ["-c", "command -v agent-autoloop"], { encoding: "utf8" }).stdout.trim();
+  if (printed && existsSync(printed) && realpathSync(printed) === realpathSync(PROGRAM)) return "agent-autoloop";
   return /\s/.test(PROGRAM) ? `'${PROGRAM}'` : PROGRAM;
 }
 
@@ -183,14 +186,25 @@ async function init(args: string[]) {
     ...(ownRules && { channels: { desktop: { key: addKey("channel", "desktop") } } }),
   };
   writeConfig(config);
-  linkSkill();
-  if (!named["no-service"]) installService();
+  try {
+    linkSkill();
+  } catch {}
+  let service = !named["no-service"];
+  if (service) {
+    try {
+      installService();
+    } catch (error) {
+      // Windows has neither launchd nor systemd: the install stands, and `up` runs by hand or from a task of its own.
+      console.log(`没装成后台常驻：${(error as Error).message}`);
+      service = false;
+    }
+  }
   const names = Object.values(agents).map((agent) => agent.name);
   const reach = ownRules ? "  通道：桌面通知\n" : "";
   const run = howToRun();
-  const next = named["no-service"]
-    ? `先运行 ${run} up 启动中台，再开一个终端运行 ${run} try 跑一遍完整流程。`
-    : `运行 ${run} try 跑一遍完整流程。`;
+  const next = service
+    ? `运行 ${run} try 跑一遍完整流程。`
+    : `先运行 ${run} up 启动中台，再开一个终端运行 ${run} try 跑一遍完整流程。`;
   console.log(`装好了。\n  Agent：${names.join("、")}\n${reach}  规则：${RULES_FILE}\n\n${next}`);
 }
 
@@ -415,7 +429,9 @@ async function doctor() {
       say(false, `读不到中台状态：${(error as Error).message}`);
     }
   }
-  if (bad) process.exit(1);
+  // Exit by code rather than process.exit(): closing this process while fetch and a plugin import still have
+  // handles open asserts in libuv on Windows.
+  process.exitCode = bad ? 1 : 0;
 }
 
 /** The rules module reads the rules file as it loads; the checks here need to survive a bad one. */

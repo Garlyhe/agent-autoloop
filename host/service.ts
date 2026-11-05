@@ -78,6 +78,9 @@ const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(
 
 export function installService() {
   mkdirSync(path.join(HOME, "logs"), { recursive: true, mode: 0o700 });
+  if (process.platform === "win32") {
+    throw new Error("Windows 上没有 systemd 或 launchd：自己把 agent-autoloop up 做成开机启动的计划任务");
+  }
   if (process.platform === "darwin") {
     mkdirSync(path.dirname(plistFile()), { recursive: true });
     writeFileSync(plistFile(), plist());
@@ -118,13 +121,24 @@ export function runningUp() {
   if (!existsSync(file)) return null;
   const pid = readFileSync(file, "utf8").trim();
   let command = "";
-  try {
-    command = execFileSync("ps", ["-p", pid, "-o", "command="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-  } catch {}
-  return /agent-autoloop(\.ts)? up\b/.test(command) ? Number(pid) : null;
+  if (process.platform === "win32") {
+    // No ps here: the process's own command line is what says the number still belongs to an `up`.
+    command =
+      spawnSync(
+        "powershell",
+        ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      ).stdout ?? "";
+  } else {
+    try {
+      command = execFileSync("ps", ["-p", pid, "-o", "command="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {}
+  }
+  // A quoted script path turns into `...agent-autoloop.ts" up`, so allow the closing quote before the verb.
+  return /agent-autoloop(\.ts)?["']?\s+up\b/.test(command) ? Number(pid) : null;
 }
 
 /** Stopping a service returns before its process is gone, and one started by hand has no service to stop it. */
@@ -138,6 +152,7 @@ export function stopUp() {
 }
 
 export function serviceRunning() {
+  if (process.platform === "win32") return false;
   if (process.platform === "darwin") return existsSync(plistFile()) && launchdHasIt();
   return spawnSync("systemctl", ["--user", "is-active", "--quiet", label()], { stdio: "ignore" }).status === 0;
 }

@@ -51,14 +51,18 @@ const found = new Map<string, string | null>();
 export function findProgram(name: string, elsewhere: () => string[] = () => []) {
   if (!found.has(name)) {
     const shell = process.env.SHELL ?? "/bin/sh";
+    // Windows has no login shell to ask, and `where` prints every match, the first one being what would run.
+    const windows = process.platform === "win32";
+    const [program, args] = windows ? ["where", [name]] : [shell, ["-lc", `command -v ${name}`]];
     let onPath: string | null = null;
     try {
-      const printed = execFileSync(shell, ["-lc", `command -v ${name}`], {
+      const printed = execFileSync(program, args, {
         encoding: "utf8",
         timeout: 15_000,
         stdio: ["ignore", "pipe", "ignore"],
       });
-      onPath = printed.trim().split("\n").at(-1) || null;
+      const lines = printed.trim().split(/\r?\n/);
+      onPath = (windows ? lines[0] : lines.at(-1)) || null;
     } catch {}
     found.set(name, onPath ?? elsewhere().find(existsSync) ?? null);
   }
