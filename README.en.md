@@ -1,5 +1,8 @@
 # Agent Autoloop
 
+> [!NOTE]
+> **Windows edition (`win` branch)**: this branch is the Windows port of agent-autoloop — the hub and workers run natively on Windows (supported since `c2c9d93`).
+
 **Let your command-line agents pick up work and follow it through in the background — staying quiet when they can handle it, and sending you a card only when a decision is yours to make.**
 
 [中文](README.md) | **English**
